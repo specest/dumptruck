@@ -1,6 +1,6 @@
 ### This is work in progress
 
-´dumptruck' tries to identify the mysql server version by looking at the files in mysql data directory.
+`dumptruck` tries to identify the mysql server version by looking at the files in mysql data directory.
 It then spins up the correct mysql container with podman, mounts the data directory, queries the database and dumps the tables of your choosing. 
 
 
