@@ -6,6 +6,7 @@ import (
 	mysqldump "dumptruck/mysqldump"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	input "github.com/JoaoDanielRufino/go-input-autocomplete"
@@ -17,23 +18,16 @@ func main() {
 	var dataDir string
 	var err error
 	if len(os.Args) > 1 {
-		path := os.Args[1]
-		if path == "." {
-			wd, err := os.Getwd()
-			dataDir = wd
-			if err != nil {
-				log.Fatal(err)
-			}
-		} else {
-			dataDir = path
-		}
-
+		dataDir = getPath(os.Args[1])
 	} else {
-		dataDir, err = input.Read("Path to directory which contains mysql data dir: ")
+		path, err := input.Read("Path to mysql data directory root (eg /var/lib/mysql): ")
 		if err != nil {
 			log.Fatal(err)
 		}
+		dataDir = getPath(path)
 	}
+
+	chmodRecursively(dataDir)
 
 	// Identify mysql version
 	var containerImage string
@@ -58,6 +52,51 @@ func main() {
 
 	// Dump the mysql databases
 	err = mysqldump.CreateMysqlDump(containerImage, context.Background(), dataDir)
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+func getPath(path string) string {
+	var dataDir string
+
+	//current working directory (mysql data dir root)
+	if path == "." {
+		wd, err := os.Getwd()
+		dataDir = wd
+		if err != nil {
+			log.Fatal(err)
+		}
+
+	} else if path[0:1] == "/" { //absolute path
+		dataDir = path
+
+	} else { // relative path
+		wd, err := os.Getwd()
+		dataDir = filepath.Join(wd, path)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	return dataDir
+
+}
+
+func chmodRecursively(root string) {
+	err := filepath.Walk(root,
+		func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			err = os.Chmod(path, os.ModePerm)
+			if err != nil {
+				return err
+			} else {
+				log.Printf("Permissions of %s changed to 0777.\n", path)
+			}
+			return nil
+		})
 	if err != nil {
 		log.Println(err)
 	}
