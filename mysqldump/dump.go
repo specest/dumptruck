@@ -179,17 +179,19 @@ func dumpDatabases(containerName string, dbs []string) error {
 }
 
 func waitForMySQL(containerName string, maxRetries int, delay time.Duration) error {
-	for i := 0; i < maxRetries; i++ {
+	var err error
+	cmd := exec.Command("podman", "exec", containerName, "mysqladmin", "-u", "root", "ping", "--silent")
+	for range maxRetries {
 		// Check if MySQL is ready by pinging it
-		cmd := exec.Command("podman", "exec", containerName, "mysqladmin", "-u", "root", "ping", "--silent")
-		if err := cmd.Run(); err == nil {
+
+		if err = cmd.Run(); err == nil {
 			// Success: MySQL is ready
 			return nil
 		}
 		log.Printf("MySQL not ready, retrying in %v...", delay)
 		time.Sleep(delay)
 	}
-	return fmt.Errorf("MySQL did not become ready in time")
+	return fmt.Errorf("MySQL did not become ready in time after %d attempts: %v", maxRetries, err)
 }
 
 func getMacOSPodmanSocket() string {
