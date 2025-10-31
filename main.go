@@ -1,9 +1,9 @@
 package main
 
 import (
-	"context"
 	identify "dumptruck/identify"
 	mysqldump "dumptruck/mysqldump"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -38,7 +38,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if detect == "Try to determine automatically" {
+	switch detect {
+	case "Try to determine automatically":
 		version, _ := identify.GetVersion(dataDir)
 		if len(version[0]) > 0 && len(version[1]) > 0 {
 			containerImage = strings.ToLower(version[0]) + ":" + version[1]
@@ -46,14 +47,14 @@ func main() {
 			log.Println("Could not determine database version")
 			containerImage = promptForDbVersion()
 		}
-	} else if detect == "Enter manually" {
+	case "Enter manually":
 		containerImage = promptForDbVersion()
 	}
 
 	// Dump the mysql databases
-	err = mysqldump.CreateMysqlDump(containerImage, context.Background(), dataDir)
+	err = mysqldump.CreateMysqlDump(containerImage, dataDir)
 	if err != nil {
-		log.Println(err)
+		log.Println("Error during MySQL dump:", err)
 	}
 }
 
@@ -103,6 +104,7 @@ func chmodRecursively(root string) {
 }
 
 func promptForDbVersion() string {
+	fmt.Println("Setting database type and version manually")
 	db, err := prompt.New().Ask("Database type:").
 		Choose([]string{"mariadb", "mysql"})
 	if err != nil {

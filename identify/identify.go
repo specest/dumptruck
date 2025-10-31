@@ -13,67 +13,117 @@ import (
 func GetVersion(path string) ([2]string, error) {
 
 	// Try .frm files
-	info, err := tryFrmFiles(path)
-	if err == nil && info[0] != "" && info[1] != "" {
-		return info, nil
+	ver, err := findFiles(path, "*.frm")
+	if err == nil && ver[0] != "" && ver[1] != "" {
+		return ver, nil
 	}
 
 	// Try binlog files, e.g binlog.000003
+	ver, err = findFiles(path, "binlog.0*")
+	if err == nil && ver[0] != "" && ver[1] != "" {
+		return ver, nil
+	}
 
-	return info, err
+	return ver, err
 }
 
-func tryFrmFiles(path string) ([2]string, error) {
+func findFiles(path, pattern string) ([2]string, error) {
 	var database string
 	var version string
+	var minor, major int
 	var none [2]string
 
-	cmd := exec.Command("find", path, "-iname", "*.frm", "-exec", "file", "{}", ";")
+	dbMap := make(map[string]int)
+
+	cmd := exec.Command("find", path, "-iname", pattern, "-exec", "file", "-b", "{}", ";")
 	stdout, err := cmd.Output()
 	if err != nil {
 		fmt.Println(err)
-		return [2]string{"", ""}, err
+		return none, err
 	}
+
 	lines := strings.Split(string(stdout), "\n")
 
+	log.Printf("Scanning for %s files", pattern)
 	for _, line := range lines {
 		if strings.Contains(line, "MySQL") || strings.Contains(line, "MariaDB") {
-			fmt.Println("Found this:")
+
 			fmt.Println(line)
 
 			f := strings.Fields(line)
 			if len(f) > 3 {
-				database = f[len(f)-3]
 				version = f[len(f)-1]
+			}
+			if strings.Contains(line, "MySQL") {
+				database = "MySQL"
+			}
+
+			if strings.Contains(line, "MariaDB") {
+				database = "MariaDB"
 			}
 
 			// Extract the version number
-			intVer, err := strconv.Atoi(version)
-			if err != nil {
-				fmt.Println("Could not convert version number to an integer")
+			// 8.0 and newer show up as
+			// MySQL replication log, server id 1 MySQL V5+, server version 8.0.44
+			// 5.6 and older look like
+			// MySQL table definition file Version 9, type MYISAM, MySQL version 50651
+
+			if strings.Contains(version, ".") {
+				v := strings.Split(version, ".")
+				major, err = strconv.Atoi(v[0])
+				if err != nil {
+					fmt.Println("Could not convert version number to an integer")
+				}
+				minor, err = strconv.Atoi(v[1])
+				if err != nil {
+					fmt.Println("Could not convert version number to an integer")
+				}
+
+			} else {
+
+				intVer, err := strconv.Atoi(version)
+				if err != nil {
+					fmt.Println("Could not convert version number to an integer")
+				} else {
+					major = intVer / 10000
+					minor = (intVer - major*10000) / 100
+					if major >= 10 {
+						database = "MariaDB"
+					}
+				}
+
 			}
-			major := intVer / 10000
-			minor := (intVer - major*10000) / 100
-			if major >= 10 {
-				database = "MariaDB"
-			}
+
 			version = strconv.Itoa(major) + "." + strconv.Itoa(minor)
 
-			fmt.Println("Trying to determine database version based on .frm files")
-
-			result, err := prompt.New().Ask("Identified database version:\n\t" + database + ":" + version).
-				Choose([]string{"Continue with identified version", "Try another *.frm file", "Try another method"})
-			if err != nil {
-				log.Println("Couldn't get user input:", err)
-			}
-
-			if result == "Continue with identified version" {
-				return [2]string{database, version}, nil
-			} else if result == "Try another method" {
-				return none, nil
+			if _, ok := dbMap[database+":"+version]; !ok {
+				dbMap[database+":"+version] = 1
+			} else {
+				dbMap[database+":"+version] = dbMap[database+":"+version] + 1
 			}
 		}
 	}
 
-	return none, nil
+	for version, times := range dbMap {
+		fmt.Printf("Found %d files pointing to version %s\n", times, version)
+	}
+
+	keys := make([]string, 0, len(dbMap))
+	for k := range dbMap {
+		keys = append(keys, k)
+	}
+	keys = append(keys, "Try other method")
+
+	result, err := prompt.New().Ask("Choose version").Choose(keys)
+	if err != nil {
+		log.Println("Couldn't get user input:", err)
+	}
+	switch result {
+	case "Try other method":
+		return none, nil
+	default:
+		s := strings.Split(result, ":")
+		return [2]string{s[0], s[1]}, nil
+	}
+
 }

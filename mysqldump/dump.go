@@ -21,7 +21,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func CreateMysqlDump(containerImage string, ctx context.Context, dataDir string) error {
+func CreateMysqlDump(containerImage string, dataDir string) error {
 
 	containerName := "dumptruck_" + strings.Replace(containerImage, ":", "", 1)
 
@@ -39,15 +39,73 @@ func CreateMysqlDump(containerImage string, ctx context.Context, dataDir string)
 		os.Exit(1)
 	}
 
-	ctx, err := bindings.NewConnection(ctx, socket)
+	ctx, err := bindings.NewConnection(context.Background(), socket)
+	if err != nil {
+		return err
+	}
+	withTimeout, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	// Check if image alreay exists
+	err = checkImageExists(withTimeout, containerImage)
 	if err != nil {
 		return err
 	}
 
-	withTimeout, _ := context.WithTimeout(ctx, 60*time.Second)
+	// Check if container alreay exists - remove if it does
+	err = checkContainerExists(withTimeout, containerName)
+	if err != nil {
+		return err
+	}
 
-	// Check if image exists. If not, then pull it
-	if ok, imageExistsErr := images.Exists(withTimeout, "docker.io/library/"+containerImage, nil); !ok {
+	// Create container
+	err = createContainer(withTimeout, containerImage, containerName, dataDir)
+	if err != nil {
+		return err
+	}
+
+	// Start the container
+	startTimeoutCtx, startCancel := context.WithTimeout(ctx, 120*time.Second)
+	defer startCancel()
+	err = start(startTimeoutCtx, containerName)
+	if err != nil {
+		return err
+	}
+
+	err = dumpDatabases(containerName)
+	if err != nil {
+		return err
+	}
+
+	// Stop container
+	log.Println("Stopping the container...")
+	err = containers.Stop(withTimeout, containerName, nil)
+	if err != nil {
+		return err
+	}
+	log.Println("Container stopped")
+
+	delete, err := prompt.New().Ask("Remove the container?").Choose([]string{"Yes", "No"})
+	if err != nil {
+		return err
+	}
+	if delete == "Yes" {
+		//Delete/remove the container
+		rm, err := containers.Remove(withTimeout, containerName, nil)
+		if err != nil {
+			log.Println("Unable to remove container", err)
+			log.Println(rm)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Check if image exists. If not, then pull it
+func checkImageExists(ctx context.Context, containerImage string) error {
+
+	if ok, imageExistsErr := images.Exists(ctx, "docker.io/library/"+containerImage, nil); !ok {
 		var options images.PullOptions
 		arch := "amd64"
 		options.Arch = &arch
@@ -61,22 +119,30 @@ func CreateMysqlDump(containerImage string, ctx context.Context, dataDir string)
 		}
 
 	}
+	return nil
+}
 
+func checkContainerExists(ctx context.Context, containerName string) error {
 	// Check if container alreay exists - remove if it does
-	exists, containerExistsErr := containers.Exists(withTimeout, containerName, nil)
+	exists, containerExistsErr := containers.Exists(ctx, containerName, nil)
 	if containerExistsErr != nil {
 		return containerExistsErr
 	}
 	if exists {
 		//Remove container
-		withTimeout, _ = context.WithTimeout(ctx, 30*time.Second)
-		_, err = containers.Remove(withTimeout, containerName, nil)
+		// ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		// defer cancel()
+		rm, err := containers.Remove(ctx, containerName, nil)
 		if err != nil {
-			log.Println("Failed to remove the container", err)
+			log.Println("Failed to remove the container", err, rm)
 		}
 	}
 
-	// Create container
+	return nil
+}
+
+func createContainer(ctx context.Context, containerImage, containerName, dataDir string) error {
+
 	s := specgen.NewSpecGenerator(containerImage, false)
 	s.Name = containerName
 	t := true
@@ -92,6 +158,12 @@ func CreateMysqlDump(containerImage string, ctx context.Context, dataDir string)
 		"MYSQL_ALLOW_EMPTY_PASSWORD": "True",
 	}
 	s.Terminal = &t
+
+	// Setting the user breaks mysql >= 8
+	//2025-10-31T13:32:12.372748Z 0 [Warning] [MY-010122] [Server] One can only use the --user switch if running as root
+	// However it is necessary for rootless container with SELinux I think ...
+	// Needs testing!
+
 	currentUser, err := user.Current()
 	if err != nil {
 		log.Fatal(err.Error())
@@ -100,32 +172,14 @@ func CreateMysqlDump(containerImage string, ctx context.Context, dataDir string)
 	userid := currentUser.Uid
 	s.User = userid
 
-	_, err = containers.CreateWithSpec(ctx, s, nil)
-	if err != nil {
-		return err
-	}
-	log.Println("Container created.")
-
-	// Start the container
-	err = start(ctx, containerName)
+	resp, err := containers.CreateWithSpec(ctx, s, nil)
 	if err != nil {
 		return err
 	}
 
-	cmd := exec.Command("podman", "exec", "-it", containerName, "mysql", "-u", "root", "-B", "-N", "-e", "SHOW DATABASES;")
-	stdout, err := cmd.Output()
-	if err != nil {
-		log.Println("Error querying database:", err)
-	}
-	databases := strings.Fields(string(stdout))
-	dumpDatabases(containerName, databases)
-
-	// Stop container
-	log.Println("Stopping the container...")
-	withTimeout, _ = context.WithTimeout(ctx, 30*time.Second)
-	err = containers.Stop(withTimeout, containerName, nil)
-	if err != nil {
-		return err
+	log.Printf("Container %s created\n", containerName)
+	if len(resp.Warnings) > 0 {
+		log.Println("Warnings:", resp.Warnings)
 	}
 
 	return nil
@@ -139,8 +193,8 @@ func start(ctx context.Context, containerName string) error {
 
 	log.Println("Container started.")
 
-	withTimeout, _ := context.WithTimeout(ctx, 60*time.Second)
-
+	withTimeout, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 	// Block until container is running
 	var opts containers.WaitOptions
 	opts.Conditions = []string{"running"}
@@ -156,12 +210,21 @@ func start(ctx context.Context, containerName string) error {
 	return nil
 }
 
-func dumpDatabases(containerName string, dbs []string) error {
+func dumpDatabases(containerName string) error {
+
+	cmd := exec.Command("podman", "exec", "-it", containerName, "mysql", "-u", "root", "-B", "-N", "-e", "SHOW DATABASES;")
+	stdout, err := cmd.Output()
+	if err != nil {
+		log.Println("Error querying database:", err)
+		return err
+	}
+	databases := strings.Fields(string(stdout))
 
 	dbs, err := prompt.New().Ask("Select databases to dump:").
-		MultiChoose(dbs)
+		MultiChoose(databases)
 	if err != nil {
 		log.Println("Choosing databases failed: ", err)
+		return err
 	}
 
 	for _, dbName := range dbs {
@@ -171,6 +234,7 @@ func dumpDatabases(containerName string, dbs []string) error {
 		stdout, err := cmd.Output()
 		if err != nil {
 			log.Println("Error querying database:", err)
+			return err
 		}
 		fmt.Println(string(stdout))
 	}
@@ -180,8 +244,9 @@ func dumpDatabases(containerName string, dbs []string) error {
 
 func waitForMySQL(containerName string, maxRetries int, delay time.Duration) error {
 	var err error
-	cmd := exec.Command("podman", "exec", containerName, "mysqladmin", "-u", "root", "ping", "--silent")
+
 	for range maxRetries {
+		cmd := exec.Command("podman", "exec", containerName, "mysqladmin", "ping", "--silent")
 		// Check if MySQL is ready by pinging it
 
 		if err = cmd.Run(); err == nil {
