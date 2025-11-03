@@ -1,6 +1,7 @@
 package main
 
 import (
+	h "dumptruck/helpers"
 	identify "dumptruck/identify"
 	mysqldump "dumptruck/mysqldump"
 	"fmt"
@@ -14,20 +15,17 @@ import (
 )
 
 func main() {
-	// Set data directory path
-	var dataDir string
+
 	var err error
-	if len(os.Args) > 1 {
-		dataDir = getPath(os.Args[1])
-	} else {
-		path, err := input.Read("Path to mysql data directory root (eg /var/lib/mysql): ")
-		if err != nil {
-			log.Fatal(err)
-		}
-		dataDir = getPath(path)
+
+	err = h.LoadEnv()
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	chmodRecursively(dataDir)
+	parseArgs()
+
+	chmodRecursively(h.Conf.DataDir)
 
 	// Identify mysql version
 	var containerImage string
@@ -40,7 +38,7 @@ func main() {
 
 	switch detect {
 	case "Try to determine automatically":
-		version, _ := identify.GetVersion(dataDir)
+		version, _ := identify.GetVersion(h.Conf.DataDir)
 		if len(version[0]) > 0 && len(version[1]) > 0 {
 			containerImage = strings.ToLower(version[0]) + ":" + version[1]
 		} else {
@@ -52,9 +50,22 @@ func main() {
 	}
 
 	// Dump the mysql databases
-	err = mysqldump.CreateMysqlDump(containerImage, dataDir)
+	err = mysqldump.CreateMysqlDump(containerImage)
 	if err != nil {
 		log.Println("Error during MySQL dump:", err)
+	}
+}
+
+func parseArgs() {
+
+	if len(os.Args) > 1 {
+		h.Conf.DataDir = getPath(os.Args[1])
+	} else {
+		path, err := input.Read("Path to mysql data directory root (eg /var/lib/mysql): ")
+		if err != nil {
+			log.Fatal(err)
+		}
+		h.Conf.DataDir = getPath(path)
 	}
 }
 

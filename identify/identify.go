@@ -104,14 +104,19 @@ func findFiles(path, pattern string) ([2]string, error) {
 		}
 	}
 
+	if len(dbMap) == 0 {
+		return none, nil
+	}
+
 	for version, times := range dbMap {
-		fmt.Printf("Found %d files pointing to version %s\n", times, version)
+		fmt.Printf("Found %d file(s) pointing to version %s\n", times, version)
 	}
 
 	keys := make([]string, 0, len(dbMap))
 	for k := range dbMap {
 		keys = append(keys, k)
 	}
+
 	keys = append(keys, "Try other method")
 
 	result, err := prompt.New().Ask("Choose version").Choose(keys)

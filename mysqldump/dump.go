@@ -3,6 +3,7 @@ package mysqldump
 import (
 	"bytes"
 	"context"
+	h "dumptruck/helpers"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -21,7 +22,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func CreateMysqlDump(containerImage string, dataDir string) error {
+func CreateMysqlDump(containerImage string) error {
 
 	containerName := "dumptruck_" + strings.Replace(containerImage, ":", "", 1)
 
@@ -59,15 +60,15 @@ func CreateMysqlDump(containerImage string, dataDir string) error {
 	}
 
 	// Create container
-	err = createContainer(withTimeout, containerImage, containerName, dataDir)
+	err = createContainer(withTimeout, containerImage, containerName, h.Conf.DataDir)
 	if err != nil {
 		return err
 	}
 
 	// Start the container
-	startTimeoutCtx, startCancel := context.WithTimeout(ctx, 120*time.Second)
-	defer startCancel()
-	err = start(startTimeoutCtx, containerName)
+	// startTimeoutCtx, startCancel := context.WithTimeout(ctx, 60*time.Second)
+	// defer startCancel()
+	err = start(ctx, containerName)
 	if err != nil {
 		return err
 	}
@@ -187,24 +188,44 @@ func createContainer(ctx context.Context, containerImage, containerName, dataDir
 
 func start(ctx context.Context, containerName string) error {
 
-	if err := containers.Start(ctx, containerName, nil); err != nil {
+	timeout, cancel := context.WithTimeout(ctx, time.Second*90)
+	defer cancel()
+	if err := containers.Start(timeout, containerName, nil); err != nil {
 		return err
 	}
 
 	log.Println("Container started.")
 
-	withTimeout, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
+	// withTimeout, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// defer cancel()
 	// Block until container is running
 	var opts containers.WaitOptions
 	opts.Conditions = []string{"running"}
-	_, err := containers.Wait(withTimeout, containerName, &opts)
+	_, err := containers.Wait(timeout, containerName, &opts)
 	if err != nil {
 		return err
 	}
 
 	// Wait for MySQL service to become ready
-	if err := waitForMySQL(containerName, 30, time.Second); err != nil {
+	if err := waitForMySQL(containerName, h.Conf.MySQLStartTimeout, time.Second); err != nil {
+		stdoutChan := make(chan string)
+		defer close(stdoutChan)
+
+		go func() {
+			for msg := range stdoutChan {
+				fmt.Println(msg)
+			}
+		}()
+
+		// Print container logs to stdout if mysql fails to start
+		logsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		logErr := containers.Logs(logsCtx, containerName, new(containers.LogOptions).WithTail("50"), stdoutChan, nil)
+		if logErr != nil {
+			log.Println("Error getting container logs:", logErr)
+		}
+
 		log.Fatalf("Error waiting for MySQL: %v", err)
 	}
 	return nil
@@ -257,6 +278,7 @@ func waitForMySQL(containerName string, maxRetries int, delay time.Duration) err
 		time.Sleep(delay)
 	}
 	return fmt.Errorf("MySQL did not become ready in time after %d attempts: %v", maxRetries, err)
+
 }
 
 func getMacOSPodmanSocket() string {
