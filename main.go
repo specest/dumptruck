@@ -1,9 +1,9 @@
 package main
 
 import (
-	h "dumptruck/helpers"
-	identify "dumptruck/identify"
-	mysqldump "dumptruck/mysqldump"
+	"dumptruck/helpers"
+	"dumptruck/identify"
+	"dumptruck/mysqldump"
 	"fmt"
 	"log"
 	"os"
@@ -14,121 +14,242 @@ import (
 	"github.com/cqroot/prompt"
 )
 
+const (
+	// File permissions for database files (owner read/write only)
+	filePermission = 0600
+	// Directory permissions (owner read/write/execute only)
+	dirPermission = 0700
+)
+
 func main() {
+	if err := run(); err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+}
 
-	var err error
-
-	err = h.LoadEnv()
+func run() error {
+	// Load configuration from environment
+	cfg, err := helpers.LoadEnv()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("failed to load environment: %w", err)
 	}
 
-	parseArgs()
+	// Parse command line arguments or prompt for data directory
+	if err := parseArgs(cfg); err != nil {
+		return fmt.Errorf("failed to parse arguments: %w", err)
+	}
 
-	chmodRecursively(h.Conf.DataDir)
+	// Validate the data directory
+	if err := validateDataDirectory(cfg.DataDir); err != nil {
+		return fmt.Errorf("invalid data directory: %w", err)
+	}
 
-	// Identify mysql version
-	var containerImage string
+	// Ask user if they want to fix permissions
+	if err := handlePermissions(cfg.DataDir); err != nil {
+		return fmt.Errorf("failed to handle permissions: %w", err)
+	}
+
+	// Identify or prompt for MySQL version
+	containerImage, err := getContainerImage(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("failed to get container image: %w", err)
+	}
+
+	log.Printf("Using container image: %s", containerImage)
+
+	// Dump the MySQL databases
+	if err := mysqldump.CreateMysqlDump(containerImage, cfg); err != nil {
+		return fmt.Errorf("failed to create MySQL dump: %w", err)
+	}
+
+	log.Println("Database dump completed successfully")
+	return nil
+}
+
+func parseArgs(cfg *helpers.Config) error {
+	if len(os.Args) > 1 {
+		path, err := getPath(os.Args[1])
+		if err != nil {
+			return fmt.Errorf("invalid path argument: %w", err)
+		}
+		cfg.DataDir = path
+	} else {
+		path, err := input.Read("Path to mysql data directory root (eg /var/lib/mysql): ")
+		if err != nil {
+			return fmt.Errorf("failed to read input: %w", err)
+		}
+		resolvedPath, err := getPath(path)
+		if err != nil {
+			return fmt.Errorf("invalid path: %w", err)
+		}
+		cfg.DataDir = resolvedPath
+	}
+	return nil
+}
+
+func getPath(path string) (string, error) {
+	var dataDir string
+
+	// Handle current working directory
+	if path == "." {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get working directory: %w", err)
+		}
+		dataDir = wd
+	} else if filepath.IsAbs(path) {
+		// Absolute path
+		dataDir = path
+	} else {
+		// Relative path - resolve to absolute
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get working directory: %w", err)
+		}
+		dataDir = filepath.Join(wd, path)
+	}
+
+	// Clean the path to remove any .. or . components
+	dataDir = filepath.Clean(dataDir)
+
+	return dataDir, nil
+}
+
+func validateDataDirectory(path string) error {
+	// Check if path exists
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("path does not exist: %s", path)
+		}
+		return fmt.Errorf("cannot access path: %w", err)
+	}
+
+	// Ensure it's a directory
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", path)
+	}
+
+	// Check if directory is readable
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("cannot read directory (permission denied?): %w", err)
+	}
+
+	// Warn if directory appears empty
+	if len(entries) == 0 {
+		log.Printf("Warning: directory appears to be empty: %s", path)
+	}
+
+	return nil
+}
+
+func handlePermissions(root string) error {
+	// Ask user if they want to fix permissions
+	fix, err := prompt.New().Ask("Some MySQL data files may have restrictive permissions. Fix permissions?").
+		Choose([]string{"Yes (recommended for container access)", "No (skip)"})
+	if err != nil {
+		return fmt.Errorf("failed to read user input: %w", err)
+	}
+
+	if fix == "No (skip)" {
+		log.Println("Skipping permission changes. Note: Container may fail to access files.")
+		return nil
+	}
+
+	log.Println("Fixing permissions (files: 0600, directories: 0700)...")
+
+	count := 0
+	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Log but don't fail on individual file errors
+			log.Printf("Warning: skipping %s: %v", path, err)
+			return nil
+		}
+
+		var targetPerm os.FileMode
+		if info.IsDir() {
+			targetPerm = dirPermission
+		} else {
+			targetPerm = filePermission
+		}
+
+		// Only change if permissions differ
+		if info.Mode().Perm() != targetPerm {
+			if err := os.Chmod(path, targetPerm); err != nil {
+				log.Printf("Warning: failed to change permissions for %s: %v", path, err)
+				return nil
+			}
+			count++
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to walk directory: %w", err)
+	}
+
+	log.Printf("Fixed permissions for %d files/directories", count)
+	return nil
+}
+
+func getContainerImage(dataDir string) (string, error) {
 	detect, err := prompt.New().Ask("Database version:").
 		Choose([]string{"Try to determine automatically", "Enter manually"})
 	if err != nil {
-		log.Println(err)
-		os.Exit(1)
+		return "", fmt.Errorf("failed to read user choice: %w", err)
 	}
 
 	switch detect {
 	case "Try to determine automatically":
-		version, _ := identify.GetVersion(h.Conf.DataDir)
-		if len(version[0]) > 0 && len(version[1]) > 0 {
-			containerImage = strings.ToLower(version[0]) + ":" + version[1]
-		} else {
-			log.Println("Could not determine database version")
-			containerImage = promptForDbVersion()
+		version, err := identify.GetVersion(dataDir)
+		if err != nil {
+			log.Printf("Warning: automatic detection encountered an error: %v", err)
+			log.Println("Falling back to manual entry...")
+			return promptForDbVersion()
 		}
+
+		if version[0] != "" && version[1] != "" {
+			containerImage := strings.ToLower(version[0]) + ":" + version[1]
+			return containerImage, nil
+		}
+
+		log.Println("Could not determine database version automatically")
+		return promptForDbVersion()
+
 	case "Enter manually":
-		containerImage = promptForDbVersion()
-	}
+		return promptForDbVersion()
 
-	// Dump the mysql databases
-	err = mysqldump.CreateMysqlDump(containerImage)
-	if err != nil {
-		log.Println("Error during MySQL dump:", err)
+	default:
+		return "", fmt.Errorf("unexpected choice: %s", detect)
 	}
 }
 
-func parseArgs() {
-
-	if len(os.Args) > 1 {
-		h.Conf.DataDir = getPath(os.Args[1])
-	} else {
-		path, err := input.Read("Path to mysql data directory root (eg /var/lib/mysql): ")
-		if err != nil {
-			log.Fatal(err)
-		}
-		h.Conf.DataDir = getPath(path)
-	}
-}
-
-func getPath(path string) string {
-	var dataDir string
-
-	//current working directory (mysql data dir root)
-	if path == "." {
-		wd, err := os.Getwd()
-		dataDir = wd
-		if err != nil {
-			log.Fatal(err)
-		}
-
-	} else if path[0:1] == "/" { //absolute path
-		dataDir = path
-
-	} else { // relative path
-		wd, err := os.Getwd()
-		dataDir = filepath.Join(wd, path)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	return dataDir
-
-}
-
-func chmodRecursively(root string) {
-	err := filepath.Walk(root,
-		func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			err = os.Chmod(path, os.ModePerm)
-			if err != nil {
-				return err
-			} else {
-				log.Printf("Permissions of %s changed to 0777.\n", path)
-			}
-			return nil
-		})
-	if err != nil {
-		log.Println(err)
-	}
-}
-
-func promptForDbVersion() string {
+func promptForDbVersion() (string, error) {
 	fmt.Println("Setting database type and version manually")
+
 	db, err := prompt.New().Ask("Database type:").
-		Choose([]string{"mariadb", "mysql"})
+		Choose([]string{"mysql", "mariadb"})
 	if err != nil {
-		log.Println("Couldn't read input", err)
-		os.Exit(1)
+		return "", fmt.Errorf("failed to read database type: %w", err)
 	}
 
-	ver, err := prompt.New().Ask("Database version major.minor, eg. 5.5, 8.3, 10.11 etc").Input("")
+	ver, err := prompt.New().Ask("Database version (major.minor, e.g., 5.5, 8.3, 10.11): ").Input("")
 	if err != nil {
-		log.Println("Couldn't read input", err)
-		os.Exit(1)
+		return "", fmt.Errorf("failed to read database version: %w", err)
 	}
 
-	return db + ":" + ver
+	// Basic validation of version format
+	ver = strings.TrimSpace(ver)
+	if ver == "" {
+		return "", fmt.Errorf("version cannot be empty")
+	}
 
+	if !strings.Contains(ver, ".") {
+		return "", fmt.Errorf("version must be in format major.minor (e.g., 8.0)")
+	}
+
+	containerImage := strings.ToLower(db) + ":" + ver
+	return containerImage, nil
 }
