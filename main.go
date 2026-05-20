@@ -153,8 +153,34 @@ func validateDataDirectory(path string) error {
 }
 
 func handlePermissions(root string) error {
-	// Ask user if they want to fix permissions
-	fix, err := prompt.New().Ask("Some MySQL data files may have restrictive permissions. Fix permissions?").
+	// First, count how many files/directories actually need permission changes
+	needsFix := false
+	count := 0
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		var targetPerm os.FileMode
+		if info.IsDir() {
+			targetPerm = dirPermission
+		} else {
+			targetPerm = filePermission
+		}
+		if info.Mode().Perm() != targetPerm {
+			count++
+			needsFix = true
+		}
+		return nil
+	})
+
+	// If permissions are already correct, skip entirely
+	if !needsFix {
+		log.Println("Permissions look fine, skipping permission changes.")
+		return nil
+	}
+
+	// Some files need fixing - ask the user
+	fix, err := prompt.New().Ask(fmt.Sprintf("Found %d file(s)/directory(ies) with restrictive permissions. Fix them?", count)).
 		Choose([]string{"Yes (recommended for container access)", "No (skip)"})
 	if err != nil {
 		return fmt.Errorf("failed to read user input: %w", err)
@@ -165,12 +191,11 @@ func handlePermissions(root string) error {
 		return nil
 	}
 
-	log.Println("Fixing permissions (files: 0644, directories: 0755)...")
+	log.Printf("Fixing permissions (files: 0644, directories: 0755)...")
 
-	count := 0
+	fixed := 0
 	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			// Log but don't fail on individual file errors
 			log.Printf("Warning: skipping %s: %v", path, err)
 			return nil
 		}
@@ -182,13 +207,12 @@ func handlePermissions(root string) error {
 			targetPerm = filePermission
 		}
 
-		// Only change if permissions differ
 		if info.Mode().Perm() != targetPerm {
 			if err := os.Chmod(path, targetPerm); err != nil {
 				log.Printf("Warning: failed to change permissions for %s: %v", path, err)
 				return nil
 			}
-			count++
+			fixed++
 		}
 
 		return nil
@@ -198,7 +222,7 @@ func handlePermissions(root string) error {
 		return fmt.Errorf("failed to walk directory: %w", err)
 	}
 
-	log.Printf("Fixed permissions for %d files/directories", count)
+	log.Printf("Fixed permissions for %d files/directories", fixed)
 	return nil
 }
 

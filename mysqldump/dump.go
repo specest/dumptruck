@@ -235,13 +235,6 @@ func createContainer(ctx context.Context, containerImage, containerName string, 
 		Options:     []string{"rbind", "z"},
 	}
 	s.Mounts = append(s.Mounts, mnt)
-	// mnt2 := specs.Mount{
-	// 	Type:        "bind",
-	// 	Source:      "./mysql.sock",
-	// 	Destination: "/var/run/mysqld/mysqld.sock",
-	// 	Options:     []string{"rbind", "z"},
-	// }
-	// s.Mounts = append(s.Mounts, mnt2)
 
 	// Configure MySQL to skip grant tables for access without password
 	s.Command = append(s.Command, "--skip-grant-tables")
@@ -314,23 +307,7 @@ func startContainer(ctx context.Context, containerName string, mysqlStartTimeout
 	if err := waitForMySQL(containerName, mysqlStartTimeout, MySQLRetryDelay); err != nil {
 		// Print container logs to help diagnose the issue
 		log.Println("MySQL failed to start. Fetching container logs...")
-
-		logsCtx, logsCancel := context.WithTimeout(ctx, 5*time.Second)
-		defer logsCancel()
-
-		stdoutChan := make(chan string)
-		go func() {
-			defer close(stdoutChan)
-			logOpts := new(containers.LogOptions).WithTail(fmt.Sprintf("%d", DefaultLogTailLines))
-			_ = containers.Logs(logsCtx, containerName, logOpts, stdoutChan, nil)
-		}()
-
-		log.Println("--- Container logs (last 50 lines) ---")
-		for msg := range stdoutChan {
-			fmt.Println(msg)
-		}
-		log.Println("--- End of container logs ---")
-
+		fetchContainerLogs(containerName)
 		return fmt.Errorf("MySQL did not become ready: %w", err)
 	}
 
@@ -420,11 +397,18 @@ func dumpDatabases(containerName string) error {
 	return nil
 }
 
-// waitForMySQL waits for MySQL to become ready by pinging it repeatedly
+// waitForMySQL waits for MySQL to become ready by pinging it repeatedly.
+// It also checks if the container is still running and aborts early if it exits.
 func waitForMySQL(containerName string, maxRetries int, delay time.Duration) error {
 	var lastErr error
 
 	for i := range maxRetries {
+		// Check if container is still running before trying to ping
+		if !isContainerRunning(containerName) {
+			log.Printf("Container %s has exited, aborting wait", containerName)
+			return fmt.Errorf("container %s exited before MySQL became ready", containerName)
+		}
+
 		// Try mysqladmin first (MySQL and older MariaDB)
 		cmd := exec.Command("podman", "exec", containerName, "mysqladmin", "ping", "--silent")
 		if err := cmd.Run(); err == nil {
@@ -448,6 +432,31 @@ func waitForMySQL(containerName string, maxRetries int, delay time.Duration) err
 	}
 
 	return fmt.Errorf("MySQL did not become ready after %d attempts: %w", maxRetries, lastErr)
+}
+
+// isContainerRunning checks if a container is currently running by inspecting it.
+func isContainerRunning(containerName string) bool {
+	cmd := exec.Command("podman", "inspect", "--format", "{{.State.Running}}", containerName)
+	output, err := cmd.Output()
+	if err != nil {
+		// If we can't inspect, assume it's gone
+		return false
+	}
+	return strings.TrimSpace(string(output)) == "true"
+}
+
+// fetchContainerLogs prints the last N lines of container logs using the podman CLI.
+// The API bindings approach is unreliable in rootless podman, so we use the CLI directly.
+func fetchContainerLogs(containerName string) {
+	log.Println("--- Container logs (last 50 lines) ---")
+	cmd := exec.Command("podman", "logs", "--tail", fmt.Sprintf("%d", DefaultLogTailLines), containerName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Warning: failed to fetch container logs: %v", err)
+	} else {
+		fmt.Print(string(output))
+	}
+	log.Println("--- End of container logs ---")
 }
 
 // promptRemoveContainer asks the user if they want to remove the container
