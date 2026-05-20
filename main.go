@@ -15,10 +15,15 @@ import (
 )
 
 const (
-	// File permissions for database files (owner read/write only)
-	filePermission = 0600
-	// Directory permissions (owner read/write/execute only)
-	dirPermission = 0700
+	// File permissions for database files (owner rw, group/other r)
+	// The container runs as the mysql user which is different from the host owner,
+	// so the "other" read bit is needed for the container to access the files.
+	filePermission = 0644
+	// Directory permissions (owner rwx, group/other rx)
+	// MySQL needs write access to the data directory to create log files.
+	// 0755 allows traversal and reading. If MySQL needs to write (e.g., redo logs),
+	// the user may need to increase to 0777.
+	dirPermission = 0755
 )
 
 func main() {
@@ -83,6 +88,9 @@ func parseArgs(cfg *helpers.Config) error {
 			return fmt.Errorf("invalid path: %w", err)
 		}
 		cfg.DataDir = resolvedPath
+	}
+	if len(os.Args) > 2 {
+		cfg.Args = os.Args[2:]
 	}
 	return nil
 }
@@ -157,7 +165,7 @@ func handlePermissions(root string) error {
 		return nil
 	}
 
-	log.Println("Fixing permissions (files: 0600, directories: 0700)...")
+	log.Println("Fixing permissions (files: 0644, directories: 0755)...")
 
 	count := 0
 	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {

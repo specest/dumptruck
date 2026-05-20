@@ -9,7 +9,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"os/user"
 	"runtime"
 	"strings"
 	"time"
@@ -91,7 +90,7 @@ func CreateMysqlDump(containerImage string, cfg *helpers.Config) error {
 	}
 
 	// Create container
-	if err := createContainer(ctx, containerImage, containerName, cfg.DataDir); err != nil {
+	if err := createContainer(ctx, containerImage, containerName, cfg); err != nil {
 		return fmt.Errorf("failed to create container: %w", err)
 	}
 	containerCreated = true
@@ -219,7 +218,7 @@ func ensureContainerRemoved(ctx context.Context, containerName string) error {
 }
 
 // createContainer creates a new container with the specified configuration
-func createContainer(ctx context.Context, containerImage, containerName, dataDir string) error {
+func createContainer(ctx context.Context, containerImage, containerName string, cfg *helpers.Config) error {
 	withTimeout, cancel := context.WithTimeout(ctx, DefaultContextTimeout)
 	defer cancel()
 
@@ -231,33 +230,43 @@ func createContainer(ctx context.Context, containerImage, containerName, dataDir
 	// Mount the data directory
 	mnt := specs.Mount{
 		Type:        "bind",
-		Source:      dataDir,
+		Source:      cfg.DataDir,
 		Destination: MySQLDataDir,
 		Options:     []string{"rbind", "z"},
 	}
 	s.Mounts = append(s.Mounts, mnt)
+	// mnt2 := specs.Mount{
+	// 	Type:        "bind",
+	// 	Source:      "./mysql.sock",
+	// 	Destination: "/var/run/mysqld/mysqld.sock",
+	// 	Options:     []string{"rbind", "z"},
+	// }
+	// s.Mounts = append(s.Mounts, mnt2)
 
 	// Configure MySQL to skip grant tables for access without password
 	s.Command = append(s.Command, "--skip-grant-tables")
+	s.Command = append(s.Command, "--socket=" + MySQLDataDir + "/mysql.sock")
+
+	// Add InnoDB force recovery if configured (useful for hot-copied data directories)
+	if cfg.InnoDBForceRecovery > 0 {
+		s.Command = append(s.Command, fmt.Sprintf("--innodb-force-recovery=%d", cfg.InnoDBForceRecovery))
+		log.Printf("Using --innodb-force-recovery=%d (data directory may be from a live server)", cfg.InnoDBForceRecovery)
+	}
+
 	s.Env = map[string]string{
 		"MYSQL_ALLOW_EMPTY_PASSWORD": "True",
 	}
 
-	terminal := true
+	// Don't allocate a TTY - it prevents the logging driver from capturing output,
+	// making it impossible to debug container failures via `podman logs` or journald.
+	terminal := false
 	s.Terminal = &terminal
 
-	// Set user to current user for rootless containers
-	// Note: This may cause issues with MySQL >= 8.0
-	// Skip setting user on macOS as it causes permission issues
-	if runtime.GOOS != "darwin" {
-		currentUser, err := user.Current()
-		if err != nil {
-			log.Printf("Warning: failed to get current user, running as default: %v", err)
-		} else {
-			s.User = currentUser.Uid
-			log.Printf("Running container as user ID: %s", currentUser.Uid)
-		}
-	}
+	// Don't force user ID - let the MySQL/MariaDB entrypoint handle user switching.
+	// The official images switch from root to the 'mysql' user internally.
+	// Forcing a host UID breaks the entrypoint's data directory detection
+	// and causes it to try re-initializing an existing data directory.
+	// See: https://github.com/docker-library/mysql/issues/582
 
 	// Create the container
 	resp, err := containers.CreateWithSpec(withTimeout, s, nil)

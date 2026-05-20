@@ -8,17 +8,21 @@ import (
 
 // Config holds the application configuration
 type Config struct {
-	MySQLStartTimeout int
-	DataDir           string
-	DbType            string
-	DbVersion         string
+	MySQLStartTimeout   int
+	DataDir             string
+	DbType              string
+	DbVersion           string
+	InnoDBForceRecovery int // 0-6, where 0 means disabled
+	Args                []string
 }
 
 const (
 	// DefaultMySQLStartTimeout is the default timeout in seconds for MySQL to start
-	DefaultMySQLStartTimeout = 30
+	DefaultMySQLStartTimeout = 300
 	// EnvMySQLStartTimeout is the environment variable name for MySQL start timeout
 	EnvMySQLStartTimeout = "MYSQL_START_TIMEOUT"
+	// EnvInnoDBForceRecovery is the environment variable for InnoDB force recovery level (1-6)
+	EnvInnoDBForceRecovery = "INNODB_FORCE_RECOVERY"
 )
 
 // LoadEnv loads configuration from environment variables and returns a Config instance.
@@ -42,6 +46,22 @@ func LoadEnv() (*Config, error) {
 		}
 
 		cfg.MySQLStartTimeout = timeout
+	}
+
+	// Load InnoDB force recovery level from environment if set
+	if recoveryStr := os.Getenv(EnvInnoDBForceRecovery); recoveryStr != "" {
+		recovery, err := strconv.Atoi(recoveryStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s value '%s': must be an integer 0-6: %w",
+				EnvInnoDBForceRecovery, recoveryStr, err)
+		}
+
+		if recovery < 0 || recovery > 6 {
+			return nil, fmt.Errorf("invalid %s value %d: must be between 0 and 6",
+				EnvInnoDBForceRecovery, recovery)
+		}
+
+		cfg.InnoDBForceRecovery = recovery
 	}
 
 	return cfg, nil
