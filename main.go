@@ -4,6 +4,7 @@ import (
 	"dumptruck/helpers"
 	"dumptruck/identify"
 	"dumptruck/mysqldump"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -39,8 +40,11 @@ func run() error {
 		return fmt.Errorf("failed to load environment: %w", err)
 	}
 
+	// Parse command line flags
+	positionalArgs := parseFlags(cfg)
+
 	// Parse command line arguments or prompt for data directory
-	if err := parseArgs(cfg); err != nil {
+	if err := parseArgs(cfg, positionalArgs); err != nil {
 		return fmt.Errorf("failed to parse arguments: %w", err)
 	}
 
@@ -50,17 +54,26 @@ func run() error {
 	}
 
 	// Ask user if they want to fix permissions
-	if err := handlePermissions(cfg.DataDir); err != nil {
+	if err := handlePermissions(cfg); err != nil {
 		return fmt.Errorf("failed to handle permissions: %w", err)
 	}
 
 	// Identify or prompt for MySQL version
-	containerImage, err := getContainerImage(cfg.DataDir)
+	containerImage, err := getContainerImage(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to get container image: %w", err)
 	}
 
 	log.Printf("Using container image: %s", containerImage)
+
+	// Server-only mode: just start the MySQL server
+	if cfg.ServerOnly {
+		if err := mysqldump.StartServerOnly(containerImage, cfg); err != nil {
+			return fmt.Errorf("failed to start server: %w", err)
+		}
+		log.Println("Server started successfully")
+		return nil
+	}
 
 	// Dump the MySQL databases
 	if err := mysqldump.CreateMysqlDump(containerImage, cfg); err != nil {
@@ -71,14 +84,67 @@ func run() error {
 	return nil
 }
 
-func parseArgs(cfg *helpers.Config) error {
-	if len(os.Args) > 1 {
-		path, err := getPath(os.Args[1])
+func parseFlags(cfg *helpers.Config) []string {
+	fs := flag.NewFlagSet("dumptruck", flag.ExitOnError)
+
+	// Main non-interactive flag (implies --fix-permissions, auto-detect, dump user DBs, remove container)
+	auto := fs.Bool("auto", false, "Non-interactive mode: auto-fix permissions, auto-detect version, dump all user databases, remove container")
+	autoS := fs.Bool("a", false, "Shorthand for --auto")
+
+	// Granular flags
+	dataDir := fs.String("data-dir", "", "Path to MySQL data directory")
+	dataDirS := fs.String("d", "", "Shorthand for --data-dir")
+	dbVersion := fs.String("version", "", "Database type:version (e.g. mysql:8.0, mariadb:10.11). Skips version detection")
+	dbVersionS := fs.String("v", "", "Shorthand for --version")
+	fixPerms := fs.Bool("fix-permissions", false, "Automatically fix file permissions without asking")
+	fixPermsS := fs.Bool("f", false, "Shorthand for --fix-permissions")
+	noRemove := fs.Bool("no-remove", false, "Do not remove container after dump")
+	noRemoveS := fs.Bool("k", false, "Shorthand for --no-remove")
+	serverOnly := fs.Bool("server-only", false, "Start the MySQL server and exit without dumping anything")
+	serverOnlyS := fs.Bool("s", false, "Shorthand for --server-only")
+
+	_ = fs.Parse(os.Args[1:])
+
+	cfg.Auto = *auto || *autoS
+	cfg.FixPermissions = *fixPerms || *fixPermsS || cfg.Auto
+	cfg.NoRemove = *noRemove || *noRemoveS
+	cfg.ServerOnly = *serverOnly || *serverOnlyS
+	cfg.DbImage = *dbVersion
+	if *dbVersionS != "" {
+		cfg.DbImage = *dbVersionS
+	}
+
+	// Resolve data directory from flag or positional arg
+	dir := *dataDir
+	if dir == "" {
+		dir = *dataDirS
+	}
+	if dir == "" && len(fs.Args()) > 0 {
+		dir = fs.Args()[0]
+	}
+	if dir != "" {
+		resolved, err := getPath(dir)
 		if err != nil {
-			return fmt.Errorf("invalid path argument: %w", err)
+			log.Fatalf("invalid path %q: %v", dir, err)
 		}
-		cfg.DataDir = path
-	} else {
+		cfg.DataDir = resolved
+	}
+
+	// Return remaining positional args (skip the one consumed as data-dir)
+	remaining := fs.Args()
+	if *dataDir == "" && *dataDirS == "" && len(remaining) > 0 {
+		return remaining[1:]
+	}
+	return remaining
+}
+
+func parseArgs(cfg *helpers.Config, positionalArgs []string) error {
+	if cfg.DataDir != "" {
+		// Data dir already set via flag or positional
+		return nil
+	}
+	if !cfg.Auto {
+		// Interactive mode: prompt for path
 		path, err := input.Read("Path to mysql data directory root (eg /var/lib/mysql): ")
 		if err != nil {
 			return fmt.Errorf("failed to read input: %w", err)
@@ -88,9 +154,8 @@ func parseArgs(cfg *helpers.Config) error {
 			return fmt.Errorf("invalid path: %w", err)
 		}
 		cfg.DataDir = resolvedPath
-	}
-	if len(os.Args) > 2 {
-		cfg.Args = os.Args[2:]
+	} else {
+		return fmt.Errorf("data directory is required in --auto mode. Use -d /path or provide it as the first argument (e.g., dumptruck -a /var/lib/mysql)")
 	}
 	return nil
 }
@@ -152,7 +217,9 @@ func validateDataDirectory(path string) error {
 	return nil
 }
 
-func handlePermissions(root string) error {
+func handlePermissions(cfg *helpers.Config) error {
+	root := cfg.DataDir
+
 	// First, count how many files/directories actually need permission changes
 	needsFix := false
 	count := 0
@@ -179,7 +246,13 @@ func handlePermissions(root string) error {
 		return nil
 	}
 
-	// Some files need fixing - ask the user
+	// In auto mode or explicit --fix-permissions, fix without asking
+	if cfg.Auto || cfg.FixPermissions {
+		log.Printf("Auto-fixing permissions for %d file(s)/directory(ies).", count)
+		return fixPermissions(root)
+	}
+
+	// Interactive mode: ask the user
 	fix, err := prompt.New().Ask(fmt.Sprintf("Found %d file(s)/directory(ies) with restrictive permissions. Fix them?", count)).
 		Choose([]string{"Yes (recommended for container access)", "No (skip)"})
 	if err != nil {
@@ -191,10 +264,13 @@ func handlePermissions(root string) error {
 		return nil
 	}
 
-	log.Printf("Fixing permissions (files: 0644, directories: 0755)...")
+	log.Printf("Fixing permissions (files: 0644, directories: 0755).")
+	return fixPermissions(root)
+}
 
+func fixPermissions(root string) error {
 	fixed := 0
-	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("Warning: skipping %s: %v", path, err)
 			return nil
@@ -226,7 +302,35 @@ func handlePermissions(root string) error {
 	return nil
 }
 
-func getContainerImage(dataDir string) (string, error) {
+func getContainerImage(cfg *helpers.Config) (string, error) {
+	dataDir := cfg.DataDir
+
+	// If -v flag was provided, use it directly
+	if cfg.DbImage != "" {
+		ver := strings.TrimSpace(cfg.DbImage)
+		if !strings.Contains(ver, ":") {
+			return "", fmt.Errorf("version must be in format type:version (e.g. mysql:8.0)")
+		}
+		return strings.ToLower(ver), nil
+	}
+
+	if cfg.Auto {
+		log.Println("Auto mode: attempting to detect database version...")
+		version, err := identify.GetVersion(dataDir, true)
+		if err != nil {
+			log.Printf("Warning: automatic detection encountered an error: %v", err)
+			return "", fmt.Errorf("could not auto-detect database version: %w. Use -v to specify version manually", err)
+		}
+
+		if version[0] != "" && version[1] != "" {
+			containerImage := strings.ToLower(version[0]) + ":" + version[1]
+			return containerImage, nil
+		}
+
+		return "", fmt.Errorf("could not determine database version automatically")
+	}
+
+	// Interactive mode
 	detect, err := prompt.New().Ask("Database version:").
 		Choose([]string{"Try to determine automatically", "Enter manually"})
 	if err != nil {
@@ -235,7 +339,7 @@ func getContainerImage(dataDir string) (string, error) {
 
 	switch detect {
 	case "Try to determine automatically":
-		version, err := identify.GetVersion(dataDir)
+		version, err := identify.GetVersion(dataDir, false)
 		if err != nil {
 			log.Printf("Warning: automatic detection encountered an error: %v", err)
 			log.Println("Falling back to manual entry...")

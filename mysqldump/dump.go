@@ -40,6 +40,58 @@ const (
 	MySQLDataDir = "/var/lib/mysql"
 )
 
+// StartServerOnly starts the MySQL container and leaves it running.
+// This is useful for debugging or manual access.
+func StartServerOnly(containerImage string, cfg *helpers.Config) error {
+	if containerImage == "" {
+		return fmt.Errorf("container image cannot be empty")
+	}
+	if cfg == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+
+	containerName := ContainerPrefix + strings.Replace(containerImage, ":", "_", -1)
+	log.Printf("Using container name: %s", containerName)
+
+	// Get Podman socket location
+	socket, err := getPodmanSocket()
+	if err != nil {
+		return fmt.Errorf("failed to get Podman socket: %w", err)
+	}
+
+	// Create connection context
+	ctx, err := bindings.NewConnection(context.Background(), socket)
+	if err != nil {
+		return fmt.Errorf("failed to connect to Podman: %w", err)
+	}
+
+	// Check if image already exists
+	if err := ensureImageExists(ctx, containerImage); err != nil {
+		return fmt.Errorf("failed to ensure image exists: %w", err)
+	}
+
+	// Check if container already exists - remove if it does
+	if err := ensureContainerRemoved(ctx, containerName); err != nil {
+		return fmt.Errorf("failed to remove existing container: %w", err)
+	}
+
+	// Create container
+	if err := createContainer(ctx, containerImage, containerName, cfg); err != nil {
+		return fmt.Errorf("failed to create container: %w", err)
+	}
+
+	// Start the container
+	if err := startContainer(ctx, containerName, cfg.MySQLStartTimeout); err != nil {
+		return fmt.Errorf("failed to start container: %w", err)
+	}
+
+	log.Printf("Server is running as container %q", containerName)
+	log.Println("Connect with: podman exec -it " + containerName + " mysql -u root")
+	log.Println("Stop with: podman stop " + containerName)
+	log.Println("Remove with: podman rm -f " + containerName)
+	return nil
+}
+
 // CreateMysqlDump creates a MySQL dump by spinning up a container with the specified image.
 // It handles the full lifecycle: pull image, create container, start it, dump databases, stop and optionally remove.
 func CreateMysqlDump(containerImage string, cfg *helpers.Config) error {
@@ -101,7 +153,7 @@ func CreateMysqlDump(containerImage string, cfg *helpers.Config) error {
 	}
 
 	// Dump databases
-	if err := dumpDatabases(containerName); err != nil {
+	if err := dumpDatabases(containerName, cfg); err != nil {
 		return fmt.Errorf("failed to dump databases: %w", err)
 	}
 
@@ -116,7 +168,7 @@ func CreateMysqlDump(containerImage string, cfg *helpers.Config) error {
 	log.Println("Container stopped successfully")
 
 	// Ask if user wants to remove the container
-	if err := promptRemoveContainer(ctx, containerName); err != nil {
+	if err := promptRemoveContainer(ctx, containerName, cfg); err != nil {
 		return fmt.Errorf("failed to remove container: %w", err)
 	}
 
@@ -320,9 +372,28 @@ func stopContainer(ctx context.Context, containerName string) error {
 	return containers.Stop(ctx, containerName, nil)
 }
 
+// systemDatabases are excluded from dumps in auto mode
+var systemDatabases = map[string]struct{}{
+	"information_schema": {},
+	"mysql":              {},
+	"performance_schema": {},
+	"sys":                {},
+}
+
+// filterUserDatabases removes system databases from the list
+func filterUserDatabases(databases []string) []string {
+	var result []string
+	for _, db := range databases {
+		if _, isSystem := systemDatabases[db]; !isSystem {
+			result = append(result, db)
+		}
+	}
+	return result
+}
+
 // dumpDatabases lists databases and dumps the ones selected by the user
-func dumpDatabases(containerName string) error {
-	log.Println("Querying available databases...")
+func dumpDatabases(containerName string, cfg *helpers.Config) error {
+	log.Println("Querying available databases..")
 
 	// Get list of databases - try both mysql and mariadb commands
 	cmd := exec.Command("podman", "exec", containerName, "mysql", "-u", "root", "-B", "-N", "-e", "SHOW DATABASES;")
@@ -346,18 +417,31 @@ func dumpDatabases(containerName string) error {
 
 	log.Printf("Found %d database(s): %s", len(databases), strings.Join(databases, ", "))
 
-	// Let user select databases to dump
-	dbs, err := prompt.New().Ask("Select databases to dump:").MultiChoose(databases)
-	if err != nil {
-		return fmt.Errorf("failed to select databases: %w", err)
-	}
+	var dbs []string
 
-	if len(dbs) == 0 {
-		log.Println("No databases selected, skipping dump")
-		return nil
-	}
+	if cfg.Auto {
+		// In auto mode, select all user databases (exclude system databases)
+		dbs = filterUserDatabases(databases)
+		if len(dbs) == 0 {
+			log.Println("No user databases found, skipping dump")
+			return nil
+		}
+		log.Printf("Auto mode: dumping %d user database(s)", len(dbs))
+	} else {
+		// Interactive mode: let user select databases to dump
+		var err error
+		dbs, err = prompt.New().Ask("Select databases to dump:").MultiChoose(databases)
+		if err != nil {
+			return fmt.Errorf("failed to select databases: %w", err)
+		}
 
-	log.Printf("Dumping %d database(s)...", len(dbs))
+		if len(dbs) == 0 {
+			log.Println("No databases selected, skipping dump")
+			return nil
+		}
+
+		log.Printf("Dumping %d database(s)...", len(dbs))
+	}
 
 	// Dump each selected database
 	for i, dbName := range dbs {
@@ -460,23 +544,34 @@ func fetchContainerLogs(containerName string) {
 }
 
 // promptRemoveContainer asks the user if they want to remove the container
-func promptRemoveContainer(ctx context.Context, containerName string) error {
-	delete, err := prompt.New().Ask("Remove the container?").Choose([]string{"Yes", "No"})
-	if err != nil {
-		return fmt.Errorf("failed to read user input: %w", err)
+// In auto mode, it removes the container automatically.
+// If --no-remove (-k) is set, the container is kept regardless.
+func promptRemoveContainer(ctx context.Context, containerName string, cfg *helpers.Config) error {
+	var remove bool
+
+	if cfg.NoRemove {
+		remove = false
+	} else if cfg.Auto {
+		remove = true
+	} else {
+		delete, err := prompt.New().Ask("Remove the container?").Choose([]string{"Yes", "No"})
+		if err != nil {
+			return fmt.Errorf("failed to read user input: %w", err)
+		}
+		remove = delete == "Yes"
 	}
 
-	if delete == "No" {
+	if !remove {
 		log.Printf("Container %s kept for manual inspection", containerName)
 		return nil
 	}
 
-	log.Println("Removing container...")
+	log.Println("Removing container..")
 
 	removeCtx, cancel := context.WithTimeout(ctx, DefaultContextTimeout)
 	defer cancel()
 
-	_, err = containers.Remove(removeCtx, containerName, nil)
+	_, err := containers.Remove(removeCtx, containerName, nil)
 	if err != nil {
 		return fmt.Errorf("failed to remove container: %w", err)
 	}

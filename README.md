@@ -12,6 +12,51 @@ It relies on the `file` and `find` utilities and should work on MacOS and Linux.
 Just run the binary and follow the instructions or give the mysql data directory path as the first argument to the executable,
 e.g: `dumptruck .` if you are in the mysql data directory or `dumptruck /path/to/data/dir`.
 
+### Flags
+
+```
+Usage: dumptruck [flags]
+
+Flags:
+  -a, --auto             Non-interactive mode: auto-fix permissions, auto-detect version,
+                         dump all user databases, remove container after
+  -d, --data-dir string  Path to MySQL data directory
+  -f, --fix-permissions  Automatically fix file permissions without asking
+  -k, --no-remove        Do not remove container after dump
+  -v, --version string   Database type:version (e.g. mysql:8.0, mariadb:10.11).
+                         Skips version detection
+```
+
+All flags are optional. The default is fully interactive mode. Use `-a` for a fully
+non-interactive run, or combine individual flags for finer control.
+
+#### Auto mode (non-interactive)
+
+Pass `-a` or `--auto` to run without prompts. This is useful for scripting or CI pipelines.
+In auto mode:
+
+- **Permissions** are automatically fixed if restrictive permissions are detected.
+- **Database version** is auto-detected from the data directory (the most common version is selected if multiple are found).
+- **User databases** are dumped automatically, excluding system databases (`information_schema`, `mysql`, `performance_schema`, `sys`).
+- **Container** is removed automatically after the dump completes.
+
+```
+# Fully automatic with positional path
+dumptruck -a /var/lib/mysql
+
+# Fully automatic with explicit data-dir flag
+dumptruck -a -d /var/lib/mysql
+
+# Specify version explicitly, still prompt for other things
+dumptruck -d /var/lib/mysql -v mysql:8.0
+
+# Force-fix permissions but stay interactive for other prompts
+dumptruck -d /var/lib/mysql -f
+
+# Auto mode but keep container after dump
+dumptruck -a /var/lib/mysql -k
+```
+
 ### Environment Variables
 
 | Variable | Default | Description |

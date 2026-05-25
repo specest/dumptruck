@@ -14,8 +14,9 @@ import (
 // in the data directory. It tries multiple detection methods in order:
 // 1. .frm files (table format files)
 // 2. binlog files (binary log files)
+// When auto is true, it picks the most common version instead of prompting.
 // Returns [database_type, version] or an error if detection fails completely.
-func GetVersion(path string) ([2]string, error) {
+func GetVersion(path string, auto bool) ([2]string, error) {
 	var none [2]string
 
 	if path == "" {
@@ -26,7 +27,7 @@ func GetVersion(path string) ([2]string, error) {
 
 	// Try .frm files first
 	log.Println("Method 1: Scanning for .frm files...")
-	ver, err := findFiles(path, "*.frm")
+	ver, err := findFiles(path, "*.frm", auto)
 	if err == nil && ver[0] != "" && ver[1] != "" {
 		log.Printf("Successfully identified version from .frm files: %s %s", ver[0], ver[1])
 		return ver, nil
@@ -39,7 +40,7 @@ func GetVersion(path string) ([2]string, error) {
 
 	// Try binlog files as fallback
 	log.Println("Method 2: Scanning for binlog files...")
-	ver, err = findFiles(path, "binlog.0*")
+	ver, err = findFiles(path, "binlog.0*", auto)
 	if err == nil && ver[0] != "" && ver[1] != "" {
 		log.Printf("Successfully identified version from binlog files: %s %s", ver[0], ver[1])
 		return ver, nil
@@ -55,7 +56,7 @@ func GetVersion(path string) ([2]string, error) {
 
 // findFiles searches for files matching the pattern and attempts to identify
 // the database version from their metadata using the 'file' utility.
-func findFiles(path, pattern string) ([2]string, error) {
+func findFiles(path, pattern string, auto bool) ([2]string, error) {
 	var none [2]string
 
 	// Execute find command with file utility
@@ -120,8 +121,8 @@ func findFiles(path, pattern string) ([2]string, error) {
 		log.Printf("  - Found %d file(s) indicating version %s", count, version)
 	}
 
-	// Let user choose if multiple versions found
-	return promptUserForVersion(dbMap)
+	// Select version based on mode
+	return selectVersion(dbMap, auto)
 }
 
 // parseDatabaseInfo extracts database type and version from a file utility output line
@@ -193,6 +194,47 @@ func parseDatabaseInfo(line string) (database, version string, err error) {
 
 	version = fmt.Sprintf("%d.%d", major, minor)
 	return database, version, nil
+}
+
+// selectVersion chooses a version from the detected map.
+// In auto mode, picks the version with the highest file count.
+// In interactive mode, prompts the user to choose.
+func selectVersion(dbMap map[string]int, auto bool) ([2]string, error) {
+	if auto {
+		return selectMostCommonVersion(dbMap)
+	}
+
+	return promptUserForVersion(dbMap)
+}
+
+// selectMostCommonVersion returns the version that appears in the most files.
+func selectMostCommonVersion(dbMap map[string]int) ([2]string, error) {
+	var none [2]string
+
+	if len(dbMap) == 0 {
+		return none, fmt.Errorf("no versions detected")
+	}
+
+	best := ""
+	bestCount := 0
+	for v, count := range dbMap {
+		if count > bestCount {
+			best = v
+			bestCount = count
+		}
+	}
+
+	if best == "" {
+		return none, fmt.Errorf("no valid version found")
+	}
+
+	parts := strings.SplitN(best, ":", 2)
+	if len(parts) != 2 {
+		return none, fmt.Errorf("invalid version format: %s", best)
+	}
+
+	log.Printf("Auto-selected version %s (found in %d file(s))", best, bestCount)
+	return [2]string{parts[0], parts[1]}, nil
 }
 
 // promptUserForVersion presents detected versions to the user and returns their choice
