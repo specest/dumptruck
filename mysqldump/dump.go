@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -92,14 +93,23 @@ func StartServerOnly(containerImage string, cfg *helpers.Config) error {
 	return nil
 }
 
+// DatabaseDump describes a single database that was dumped to disk.
+type DatabaseDump struct {
+	Name     string `json:"name"`
+	DumpFile string `json:"dump_file"`
+	Tables   int    `json:"tables"`
+	Rows     int    `json:"rows"`
+}
+
 // CreateMysqlDump creates a MySQL dump by spinning up a container with the specified image.
 // It handles the full lifecycle: pull image, create container, start it, dump databases, stop and optionally remove.
-func CreateMysqlDump(containerImage string, cfg *helpers.Config) error {
+// It returns the list of databases that were dumped along with their on-disk paths.
+func CreateMysqlDump(containerImage string, cfg *helpers.Config) ([]DatabaseDump, error) {
 	if containerImage == "" {
-		return fmt.Errorf("container image cannot be empty")
+		return nil, fmt.Errorf("container image cannot be empty")
 	}
 	if cfg == nil {
-		return fmt.Errorf("config cannot be nil")
+		return nil, fmt.Errorf("config cannot be nil")
 	}
 
 	containerName := ContainerPrefix + strings.Replace(containerImage, ":", "_", -1)
@@ -108,13 +118,13 @@ func CreateMysqlDump(containerImage string, cfg *helpers.Config) error {
 	// Get Podman socket location
 	socket, err := getPodmanSocket()
 	if err != nil {
-		return fmt.Errorf("failed to get Podman socket: %w", err)
+		return nil, fmt.Errorf("failed to get Podman socket: %w", err)
 	}
 
 	// Create connection context
 	ctx, err := bindings.NewConnection(context.Background(), socket)
 	if err != nil {
-		return fmt.Errorf("failed to connect to Podman: %w", err)
+		return nil, fmt.Errorf("failed to connect to Podman: %w", err)
 	}
 
 	// Setup cleanup on failure
@@ -133,28 +143,29 @@ func CreateMysqlDump(containerImage string, cfg *helpers.Config) error {
 
 	// Check if image already exists
 	if err := ensureImageExists(ctx, containerImage); err != nil {
-		return fmt.Errorf("failed to ensure image exists: %w", err)
+		return nil, fmt.Errorf("failed to ensure image exists: %w", err)
 	}
 
 	// Check if container already exists - remove if it does
 	if err := ensureContainerRemoved(ctx, containerName); err != nil {
-		return fmt.Errorf("failed to remove existing container: %w", err)
+		return nil, fmt.Errorf("failed to remove existing container: %w", err)
 	}
 
 	// Create container
 	if err := createContainer(ctx, containerImage, containerName, cfg); err != nil {
-		return fmt.Errorf("failed to create container: %w", err)
+		return nil, fmt.Errorf("failed to create container: %w", err)
 	}
 	containerCreated = true
 
 	// Start the container
 	if err := startContainer(ctx, containerName, cfg.MySQLStartTimeout); err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
+		return nil, fmt.Errorf("failed to start container: %w", err)
 	}
 
 	// Dump databases
-	if err := dumpDatabases(containerName, cfg); err != nil {
-		return fmt.Errorf("failed to dump databases: %w", err)
+	dumps, err := dumpDatabases(containerName, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dump databases: %w", err)
 	}
 
 	// Stop container
@@ -163,17 +174,17 @@ func CreateMysqlDump(containerImage string, cfg *helpers.Config) error {
 	defer stopCancel()
 
 	if err := containers.Stop(stopCtx, containerName, nil); err != nil {
-		return fmt.Errorf("failed to stop container: %w", err)
+		return nil, fmt.Errorf("failed to stop container: %w", err)
 	}
 	log.Println("Container stopped successfully")
 
 	// Ask if user wants to remove the container
 	if err := promptRemoveContainer(ctx, containerName, cfg); err != nil {
-		return fmt.Errorf("failed to remove container: %w", err)
+		return nil, fmt.Errorf("failed to remove container: %w", err)
 	}
 
 	containerCreated = false // Disable cleanup since we're done
-	return nil
+	return dumps, nil
 }
 
 // getPodmanSocket returns the Podman socket path based on the operating system
@@ -290,7 +301,7 @@ func createContainer(ctx context.Context, containerImage, containerName string, 
 
 	// Configure MySQL to skip grant tables for access without password
 	s.Command = append(s.Command, "--skip-grant-tables")
-	s.Command = append(s.Command, "--socket=" + MySQLDataDir + "/mysql.sock")
+	s.Command = append(s.Command, "--socket="+MySQLDataDir+"/mysql.sock")
 
 	// Add InnoDB force recovery if configured (useful for hot-copied data directories)
 	if cfg.InnoDBForceRecovery > 0 {
@@ -392,7 +403,7 @@ func filterUserDatabases(databases []string) []string {
 }
 
 // dumpDatabases lists databases and dumps the ones selected by the user
-func dumpDatabases(containerName string, cfg *helpers.Config) error {
+func dumpDatabases(containerName string, cfg *helpers.Config) ([]DatabaseDump, error) {
 	log.Println("Querying available databases..")
 
 	// Get list of databases - try both mysql and mariadb commands
@@ -404,15 +415,15 @@ func dumpDatabases(containerName string, cfg *helpers.Config) error {
 		stdout, err = cmd.Output()
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
-				return fmt.Errorf("failed to query databases: %w (stderr: %s)", err, string(exitErr.Stderr))
+				return nil, fmt.Errorf("failed to query databases: %w (stderr: %s)", err, string(exitErr.Stderr))
 			}
-			return fmt.Errorf("failed to query databases: %w", err)
+			return nil, fmt.Errorf("failed to query databases: %w", err)
 		}
 	}
 
 	databases := strings.Fields(string(stdout))
 	if len(databases) == 0 {
-		return fmt.Errorf("no databases found")
+		return nil, fmt.Errorf("no databases found")
 	}
 
 	log.Printf("Found %d database(s): %s", len(databases), strings.Join(databases, ", "))
@@ -424,7 +435,7 @@ func dumpDatabases(containerName string, cfg *helpers.Config) error {
 		dbs = filterUserDatabases(databases)
 		if len(dbs) == 0 {
 			log.Println("No user databases found, skipping dump")
-			return nil
+			return nil, nil
 		}
 		log.Printf("Auto mode: dumping %d user database(s)", len(dbs))
 	} else {
@@ -432,18 +443,19 @@ func dumpDatabases(containerName string, cfg *helpers.Config) error {
 		var err error
 		dbs, err = prompt.New().Ask("Select databases to dump:").MultiChoose(databases)
 		if err != nil {
-			return fmt.Errorf("failed to select databases: %w", err)
+			return nil, fmt.Errorf("failed to select databases: %w", err)
 		}
 
 		if len(dbs) == 0 {
 			log.Println("No databases selected, skipping dump")
-			return nil
+			return nil, nil
 		}
 
 		log.Printf("Dumping %d database(s)...", len(dbs))
 	}
 
 	// Dump each selected database
+	dumps := make([]DatabaseDump, 0, len(dbs))
 	for i, dbName := range dbs {
 		log.Printf("[%d/%d] Dumping database: %s", i+1, len(dbs), dbName)
 
@@ -464,9 +476,9 @@ func dumpDatabases(containerName string, cfg *helpers.Config) error {
 
 			if err != nil {
 				if exitErr, ok := err.(*exec.ExitError); ok {
-					return fmt.Errorf("failed to dump database %s: %w (output: %s)", dbName, err, string(exitErr.Stderr))
+					return nil, fmt.Errorf("failed to dump database %s: %w (output: %s)", dbName, err, string(exitErr.Stderr))
 				}
-				return fmt.Errorf("failed to dump database %s: %w", dbName, err)
+				return nil, fmt.Errorf("failed to dump database %s: %w", dbName, err)
 			}
 		}
 
@@ -474,11 +486,18 @@ func dumpDatabases(containerName string, cfg *helpers.Config) error {
 			log.Printf("  Output: %s", string(output))
 		}
 
+		// Dumps are written to MySQLDataDir inside the container, which is the
+		// bind-mounted data directory, so the file lands at cfg.DataDir/<db>.sql.
+		dumps = append(dumps, DatabaseDump{
+			Name:     dbName,
+			DumpFile: filepath.Join(cfg.DataDir, dumpName),
+		})
+
 		log.Printf("  ✓ Successfully dumped %s to %s", dbName, dumpName)
 	}
 
 	log.Println("All database dumps completed successfully")
-	return nil
+	return dumps, nil
 }
 
 // waitForMySQL waits for MySQL to become ready by pinging it repeatedly.
@@ -538,7 +557,7 @@ func fetchContainerLogs(containerName string) {
 	if err != nil {
 		log.Printf("Warning: failed to fetch container logs: %v", err)
 	} else {
-		fmt.Print(string(output))
+		fmt.Fprint(os.Stderr, string(output))
 	}
 	log.Println("--- End of container logs ---")
 }

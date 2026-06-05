@@ -12,11 +12,12 @@ type Config struct {
 	DataDir             string
 	DbType              string
 	DbVersion           string
-	InnoDBForceRecovery int // 0-6, where 0 means disabled
+	InnoDBForceRecovery int  // 0-6, where 0 means disabled
 	Auto                bool // convenience: implies FixPermissions + auto-detect + dump user DBs + remove container
 	FixPermissions      bool
 	NoRemove            bool
 	ServerOnly          bool
+	JSONOutput          bool   // emit a machine-readable JSON result to stdout; logs go to stderr
 	DbImage             string // explicit "type:version" from -v flag
 	Args                []string
 }

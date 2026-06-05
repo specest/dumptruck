@@ -4,6 +4,7 @@ import (
 	"dumptruck/helpers"
 	"dumptruck/identify"
 	"dumptruck/mysqldump"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -27,22 +28,60 @@ const (
 	dirPermission = 0755
 )
 
-func main() {
-	if err := run(); err != nil {
-		log.Fatalf("Error: %v", err)
-	}
+// jsonResult is the machine-readable result emitted to stdout when --json is set.
+type jsonResult struct {
+	Success   bool                     `json:"success"`
+	Engine    *string                  `json:"engine"`
+	Version   *string                  `json:"version"`
+	DataDir   *string                  `json:"data_dir"`
+	OutputDir *string                  `json:"output_dir"`
+	Databases []mysqldump.DatabaseDump `json:"databases"`
+	Errors    []string                 `json:"errors"`
 }
 
-func run() error {
+func main() {
 	// Load configuration from environment
 	cfg, err := helpers.LoadEnv()
 	if err != nil {
-		return fmt.Errorf("failed to load environment: %w", err)
+		// Flags (including --json) have not been parsed yet, so report the
+		// environment error in human-readable form on stderr.
+		log.Fatalf("Error: failed to load environment: %v", err)
 	}
 
-	// Parse command line flags
+	// Parse command line flags (sets cfg.JSONOutput).
 	positionalArgs := parseFlags(cfg)
 
+	// Result is populated incrementally as the run progresses. The slices are
+	// initialized so they serialize as [] rather than null.
+	result := &jsonResult{
+		Databases: []mysqldump.DatabaseDump{},
+		Errors:    []string{},
+	}
+
+	runErr := run(cfg, positionalArgs, result)
+
+	if cfg.JSONOutput {
+		result.Success = runErr == nil
+		if runErr != nil {
+			result.Errors = append(result.Errors, runErr.Error())
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if encErr := enc.Encode(result); encErr != nil {
+			log.Printf("failed to encode JSON result: %v", encErr)
+		}
+		if runErr != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if runErr != nil {
+		log.Fatalf("Error: %v", runErr)
+	}
+}
+
+func run(cfg *helpers.Config, positionalArgs []string, result *jsonResult) error {
 	// Parse command line arguments or prompt for data directory
 	if err := parseArgs(cfg, positionalArgs); err != nil {
 		return fmt.Errorf("failed to parse arguments: %w", err)
@@ -53,6 +92,12 @@ func run() error {
 		return fmt.Errorf("invalid data directory: %w", err)
 	}
 
+	// Dumps are written into the bind-mounted data directory, so the output
+	// directory is the data directory itself.
+	dataDir := cfg.DataDir
+	result.DataDir = &dataDir
+	result.OutputDir = &dataDir
+
 	// Ask user if they want to fix permissions
 	if err := handlePermissions(cfg); err != nil {
 		return fmt.Errorf("failed to handle permissions: %w", err)
@@ -62,6 +107,11 @@ func run() error {
 	containerImage, err := getContainerImage(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to get container image: %w", err)
+	}
+
+	if engine, version, ok := splitImage(containerImage); ok {
+		result.Engine = &engine
+		result.Version = &version
 	}
 
 	log.Printf("Using container image: %s", containerImage)
@@ -76,12 +126,26 @@ func run() error {
 	}
 
 	// Dump the MySQL databases
-	if err := mysqldump.CreateMysqlDump(containerImage, cfg); err != nil {
+	dumps, err := mysqldump.CreateMysqlDump(containerImage, cfg)
+	if err != nil {
 		return fmt.Errorf("failed to create MySQL dump: %w", err)
+	}
+	if dumps != nil {
+		result.Databases = dumps
 	}
 
 	log.Println("Database dump completed successfully")
 	return nil
+}
+
+// splitImage splits a "type:version" container image string (e.g. "mysql:8.0")
+// into its engine and version parts. ok is false if the format is unexpected.
+func splitImage(image string) (engine, version string, ok bool) {
+	parts := strings.SplitN(image, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 func parseFlags(cfg *helpers.Config) []string {
@@ -102,6 +166,7 @@ func parseFlags(cfg *helpers.Config) []string {
 	noRemoveS := fs.Bool("k", false, "Shorthand for --no-remove")
 	serverOnly := fs.Bool("server-only", false, "Start the MySQL server and exit without dumping anything")
 	serverOnlyS := fs.Bool("s", false, "Shorthand for --server-only")
+	jsonOut := fs.Bool("json", false, "Emit a machine-readable JSON result to stdout; all human-readable output goes to stderr")
 
 	_ = fs.Parse(os.Args[1:])
 
@@ -109,6 +174,7 @@ func parseFlags(cfg *helpers.Config) []string {
 	cfg.FixPermissions = *fixPerms || *fixPermsS || cfg.Auto
 	cfg.NoRemove = *noRemove || *noRemoveS
 	cfg.ServerOnly = *serverOnly || *serverOnlyS
+	cfg.JSONOutput = *jsonOut
 	cfg.DbImage = *dbVersion
 	if *dbVersionS != "" {
 		cfg.DbImage = *dbVersionS
@@ -363,7 +429,7 @@ func getContainerImage(cfg *helpers.Config) (string, error) {
 }
 
 func promptForDbVersion() (string, error) {
-	fmt.Println("Setting database type and version manually")
+	fmt.Fprintln(os.Stderr, "Setting database type and version manually")
 
 	db, err := prompt.New().Ask("Database type:").
 		Choose([]string{"mysql", "mariadb"})
